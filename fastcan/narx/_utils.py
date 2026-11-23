@@ -151,6 +151,7 @@ def print_narx(
         "batch_size": [
             Interval(Integral, 1, None, closed="left"),
         ],
+        "shared_terms": ["boolean"],
         "refine_verbose": ["verbose"],
         "refine_drop": [
             None,
@@ -179,6 +180,7 @@ def make_narx(
     static_indices=None,
     lazy=False,
     batch_size=16,
+    shared_terms=False,
     refine_verbose=1,
     refine_drop=None,
     refine_max_iter=None,
@@ -245,6 +247,28 @@ def make_narx(
 
         .. versionadded:: 0.6.1
 
+    shared_terms : bool, default=False
+        Whether to select the polynomial terms jointly for all outputs, so
+        that one term can be shared by multiple outputs. If True, terms are
+        selected greedily to maximize the sum of the variance explained for
+        each output, where every output is standardized to unit variance
+        first, so that outputs with larger magnitude do not dominate the
+        selection. Each selected term is booked to every output for which
+        it is competitive, i.e. it explains a non-trivial amount of
+        variance and is at least half as good as the best term still
+        available for that output, and counts towards the
+        `n_terms_to_select` budget of each of those outputs. As a
+        result, the same term may appear in the models of several outputs
+        (i.e. a shared term), while each output still gets exactly its own
+        budget of terms. The selected terms, including the shared ones, are
+        stored in the returned model and are exactly the features used at
+        prediction time. Only available when `lazy` is False. When
+        `shared_terms` is True, `refine_verbose`, `refine_drop`,
+        `refine_max_iter` and `**params` are not used. If `y` has a single
+        output, this parameter has no effect.
+
+        .. versionadded:: 0.7.0
+
     refine_verbose : int, default=1
         The verbosity level of refine. Only available when `lazy` is False.
 
@@ -304,6 +328,39 @@ def make_narx(
     |  0  |   X[k,0]*X[k,0]    |  0.306   |
     |  0  | X[k-1,0]*X[k-3,0]  |  2.000   |
     |  0  |  X[k-2,0]*X[k,1]   |  1.528   |
+
+    For a multi-output system, e.g. a greenhouse where the temperature and
+    the humidity are both driven by a common input signal, the terms can be
+    selected jointly with `shared_terms=True`, so that one term can be
+    shared by several outputs while each output still gets its own budget
+    of terms:
+
+    >>> rng = np.random.default_rng(12345)
+    >>> n_samples = 1000
+    >>> max_delay = 3
+    >>> e0 = rng.normal(0, 0.1, n_samples)
+    >>> e1 = rng.normal(0, 0.02, n_samples)
+    >>> u = rng.uniform(0, 1, n_samples+max_delay) # common input signal
+    >>> y0 = np.zeros(n_samples+max_delay) # temperature
+    >>> y1 = np.zeros(n_samples+max_delay) # humidity
+    >>> for i in range(max_delay, n_samples+max_delay):
+    ...     y0[i] = 0.6*y0[i-1] + 8*u[i-1]**2 + 4*u[i-2] + 20
+    ...     y1[i] = 0.5*y1[i-1] + 0.2*u[i-1]**2 + 0.1*u[i-3] + 0.5
+    >>> y = np.c_[y0[max_delay:]+e0, y1[max_delay:]+e1]
+    >>> X = u[max_delay:].reshape(-1, 1)
+    >>> narx = make_narx(X, y, n_terms_to_select=[3, 3], max_delay=3,
+    ...                  poly_degree=2, shared_terms=True).fit(X, y)
+    >>> print_narx(narx)
+    | yid |        Term        |   Coef   |
+    |-----|--------------------|----------|
+    |  0  |     Intercept      |  21.203  |
+    |  1  |     Intercept      |  0.387   |
+    |  0  |    y_hat[k-1,0]    |  0.580   |
+    |  0  | X[k-1,0]*X[k-1,0]  |  8.019   |
+    |  0  |X[k-2,0]*y_hat[k-3,0]|  0.067   |
+    |  1  |    y_hat[k-1,0]    |  0.012   |
+    |  1  | X[k-1,0]*X[k-1,0]  |  0.197   |
+    |  1  |      X[k-3,0]      |  0.045   |
     """
     xp, _, device_ = get_namespace_and_device(y)
     y = check_array(
@@ -342,6 +399,8 @@ def make_narx(
                 f"the number of outputs, {n_outputs}, but got "
                 f"{len(n_terms_to_select)}."
             )
+    if shared_terms and lazy:
+        raise ValueError("`shared_terms` is not supported when `lazy` is True.")
     session_sizes_cumsum = _validate_session_sizes(session_sizes, n_samples)
 
     if include_zero_delay is None:
@@ -410,24 +469,32 @@ def make_narx(
         poly_terms_masked = move_to(poly_terms_masked, xp=np, device="cpu")
         y_masked = move_to(y_masked, xp=np, device="cpu")
 
-        selected_poly_ids = []
-        for i in range(n_outputs):
-            csf = FastCan(
-                n_terms_to_select[i],
-                **params,
-            ).fit(poly_terms_masked, y_masked[:, i])
-            if refine_drop is not None:
-                indices, _ = refine(
-                    csf,
-                    drop=refine_drop,
-                    max_iter=refine_max_iter,
-                    verbose=refine_verbose,
-                )
-                support = np.zeros(shape=poly_ids_all.shape[0], dtype=bool)
-                support[indices] = True
-            else:
-                support = csf.get_support()
-            selected_poly_ids.append(poly_ids_all[support])
+        if shared_terms and n_outputs > 1:
+            selected_ids = _select_shared_terms(
+                poly_terms_masked,
+                y_masked,
+                n_terms_to_select,
+            )
+            selected_poly_ids = [poly_ids_all[ids] for ids in selected_ids]
+        else:
+            selected_poly_ids = []
+            for i in range(n_outputs):
+                csf = FastCan(
+                    n_terms_to_select[i],
+                    **params,
+                ).fit(poly_terms_masked, y_masked[:, i])
+                if refine_drop is not None:
+                    indices, _ = refine(
+                        csf,
+                        drop=refine_drop,
+                        max_iter=refine_max_iter,
+                        verbose=refine_verbose,
+                    )
+                    support = np.zeros(shape=poly_ids_all.shape[0], dtype=bool)
+                    support[indices] = True
+                else:
+                    support = csf.get_support()
+                selected_poly_ids.append(poly_ids_all[support])
 
     selected_poly_ids = np.vstack(selected_poly_ids)
 
@@ -451,6 +518,131 @@ def make_narx(
         output_ids=output_ids,
         fit_intercept=fit_intercept,
     )
+
+
+def _select_shared_terms(poly_terms, y, n_terms_to_select):
+    """Select polynomial terms jointly for multiple outputs.
+
+    Greedy forward selection where each selected term is booked to every
+    output for which it is competitive, so one term can be shared by
+    several outputs while counting towards the term budget of each of
+    them.
+
+    Parameters
+    ----------
+    poly_terms : ndarray of shape (n_samples, n_candidates)
+        The candidate polynomial terms with missing values removed.
+
+    y : ndarray of shape (n_samples, n_outputs)
+        The targets with missing values removed.
+
+    n_terms_to_select : ndarray of shape (n_outputs,)
+        The number of terms to select for each output.
+
+    Returns
+    -------
+    selected_ids : list of ndarray
+        The indices of the selected candidate terms for each output, in the
+        order they were booked. The i-th array has `n_terms_to_select`[i]
+        elements.
+    """
+    n_samples, n_candidates = poly_terms.shape
+    n_outputs = y.shape[1]
+    budgets = np.asarray(n_terms_to_select, dtype=int).copy()
+    for i, budget in enumerate(budgets):
+        if budget > n_candidates:
+            raise ValueError(
+                f"`n_terms_to_select` for output {i} is {budget}, which is "
+                f"larger than the number of candidate terms {n_candidates}."
+            )
+
+    # Standardize each output to unit variance, so that the joint gain of a
+    # term is not dominated by the outputs with larger magnitude.
+    y_centered = y - y.mean(axis=0)
+    y_std = y_centered.std(axis=0)
+    y_std[y_std == 0] = 1.0
+    residuals = y_centered / y_std
+
+    # Center and normalize the candidate terms. The gains are then measured
+    # as the explained variance of the standardized outputs, while the
+    # intercept is handled separately by the model.
+    terms_centered = poly_terms - poly_terms.mean(axis=0)
+    term_norms = np.linalg.norm(terms_centered, axis=0)
+    term_norms[term_norms == 0] = 1.0
+    terms_centered /= term_norms
+
+    # A term is booked to an output only when it is competitive for that
+    # output: it explains more variance than an irrelevant term would on
+    # average, and it is at least half as good as the best term still
+    # available for that output. As each output is standardized to unit
+    # variance, its residual sum of squares is `n_samples`, and an
+    # irrelevant term explains 1/`n_samples` of it, i.e. 1.0, on average.
+    noise_floor = 1.0
+    competitiveness = 0.5
+
+    ortho_basis = [np.empty((n_samples, 0)) for _ in range(n_outputs)]
+    booked = np.zeros((n_candidates, n_outputs), dtype=bool)
+    selected_ids = [[] for _ in range(n_outputs)]
+
+    def _book(term_id, output_id):
+        """Book a term to an output and update its basis and residual."""
+        basis = ortho_basis[output_id]
+        direction = terms_centered[:, term_id]
+        if basis.shape[1] > 0:
+            direction = direction - basis @ (basis.T @ direction)
+        norm = np.linalg.norm(direction)
+        if norm > 1e-12:
+            direction /= norm
+            ortho_basis[output_id] = np.column_stack([basis, direction])
+            residuals[:, output_id] -= direction * (direction @ residuals[:, output_id])
+        booked[term_id, output_id] = True
+        budgets[output_id] -= 1
+        selected_ids[output_id].append(term_id)
+
+    while np.any(budgets > 0):
+        # Gains of the candidate terms for each output with remaining
+        # budget, measured on the standardized residuals.
+        gains = np.zeros((n_candidates, n_outputs))
+        for i in range(n_outputs):
+            if budgets[i] == 0:
+                continue
+            basis = ortho_basis[i]
+            if basis.shape[1] == 0:
+                ortho_terms = terms_centered
+            else:
+                ortho_terms = terms_centered - basis @ (basis.T @ terms_centered)
+            ortho_norm2 = np.einsum("ij,ij->j", ortho_terms, ortho_terms)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                gains[:, i] = np.where(
+                    ortho_norm2 > 1e-12,
+                    np.square(ortho_terms.T @ residuals[:, i]) / ortho_norm2,
+                    0.0,
+                )
+        gains[booked] = 0.0
+        term_id = np.argmax(gains.sum(axis=1))
+
+        # Book the term to every output with remaining budget for which the
+        # term is competitive (shared-term accounting).
+        booked_any = False
+        for i in range(n_outputs):
+            if budgets[i] == 0 or booked[term_id, i]:
+                continue
+            if gains[term_id, i] > noise_floor and gains[term_id, i] >= (
+                competitiveness * gains[:, i].max()
+            ):
+                _book(term_id, i)
+                booked_any = True
+        if not booked_any:
+            # Guarantee progress: book the best remaining (term, output)
+            # pair even when no gain beats the noise floor.
+            remaining_gains = np.where(booked, -np.inf, gains)
+            remaining_gains[:, budgets == 0] = -np.inf
+            term_id, output_id = np.unravel_index(
+                np.argmax(remaining_gains), remaining_gains.shape
+            )
+            _book(term_id, output_id)
+
+    return [np.array(ids, dtype=int) for ids in selected_ids]
 
 
 def _gen_poly_time_shift_terms(

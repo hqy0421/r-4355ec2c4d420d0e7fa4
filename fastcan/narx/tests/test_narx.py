@@ -630,6 +630,72 @@ def test_make_narx_lazy(array_type, monkeypatch):
     assert_array_equal(narx_normal.delay_ids, narx_lazy.delay_ids)
 
 
+def test_make_narx_shared_terms():
+    """Test joint selection with shared-term accounting in make_narx."""
+    rng = np.random.default_rng(12345)
+    n_samples = 1000
+    max_delay = 3
+    e0 = rng.normal(0, 0.1, n_samples)
+    e1 = rng.normal(0, 0.02, n_samples)
+    u = rng.uniform(0, 1, n_samples + max_delay)  # common input signal
+    y0 = np.zeros(n_samples + max_delay)  # temperature-like output (large scale)
+    y1 = np.zeros(n_samples + max_delay)  # humidity-like output (small scale)
+    for i in range(max_delay, n_samples + max_delay):
+        y0[i] = 0.6 * y0[i - 1] + 8 * u[i - 1] ** 2 + 4 * u[i - 2] + 20
+        y1[i] = 0.5 * y1[i - 1] + 0.2 * u[i - 1] ** 2 + 0.1 * u[i - 3] + 0.5
+    y = np.c_[y0[max_delay:] + e0, y1[max_delay:] + e1]
+    X = u[max_delay:].reshape(-1, 1)
+    n_terms_to_select = [3, 3]
+
+    narx = make_narx(
+        X,
+        y,
+        n_terms_to_select=n_terms_to_select,
+        max_delay=max_delay,
+        poly_degree=2,
+        shared_terms=True,
+    )
+    # Per-target term constraints: each output gets exactly its budget
+    assert_array_equal(np.bincount(narx.output_ids), n_terms_to_select)
+    # Shared-term accounting: a term shared by both outputs is booked to
+    # each of them but stored once, so there are fewer distinct terms
+    # than bookings
+    n_bookings = narx.feat_ids.shape[0]
+    n_distinct = np.unique(np.c_[narx.feat_ids, narx.delay_ids], axis=0).shape[0]
+    assert n_distinct < n_bookings
+
+    # The selected features are the ones used at prediction time
+    narx.fit(X, y)
+    y_hat = narx.predict(X, y_init=y[: narx.max_delay_])
+    assert r2_score(y[:, 0], y_hat[:, 0]) > 0.9
+    assert r2_score(y[:, 1], y_hat[:, 1]) > 0.9
+
+    # The selection is not dominated by the output with larger magnitude
+    narx_scaled = make_narx(
+        X,
+        np.c_[y[:, 0] * 1e6, y[:, 1]],
+        n_terms_to_select=n_terms_to_select,
+        max_delay=max_delay,
+        poly_degree=2,
+        shared_terms=True,
+    )
+    assert_array_equal(narx_scaled.feat_ids, narx.feat_ids)
+    assert_array_equal(narx_scaled.delay_ids, narx.delay_ids)
+    assert_array_equal(narx_scaled.output_ids, narx.output_ids)
+
+    # `shared_terms` is not supported with `lazy`
+    with pytest.raises(ValueError, match="`shared_terms` is not supported"):
+        make_narx(X, y, 3, max_delay, 2, lazy=True, shared_terms=True)
+
+    # The budget of an output cannot exceed the number of candidate terms
+    with pytest.raises(ValueError, match="larger than the number of candidate"):
+        make_narx(X, y, [100, 100], max_delay, 1, shared_terms=True)
+
+    # `shared_terms` has no effect for a single output
+    narx_1d = make_narx(X, y[:, 0], 3, max_delay, 2, shared_terms=True, verbose=0)
+    assert narx_1d.feat_ids.shape[0] == 3
+
+
 def test_make_narx_max_candidates():
     """Test max_candidates and random_state in make_narx."""
     rng = np.random.default_rng(12345)
